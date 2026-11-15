@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>コンペ幹事サポート</title>
+  <meta name="theme-color" content="#1b6b44">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="コンペ幹事">
+  <meta name="format-detection" content="telephone=no">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button type="button" class="back" id="backBtn" hidden aria-label="戻る">‹ 戻る</button>
+    <h1 id="title">コンペ幹事サポート</h1>
+  </header>
+  <main id="app" tabindex="-1"></main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="overlay" class="overlay" hidden></div>
+  <noscript>このツールを使うには JavaScript を有効にしてください。</noscript>
+  <script src="logic.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "コンペ幹事サポート",
+  "short_name": "コンペ幹事",
+  "description": "ゴルフコンペの順位・各賞・ポイント・新ハンディキャップを計算する幹事用ツール",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f6f3",
+  "theme_color": "#1b6b44",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
