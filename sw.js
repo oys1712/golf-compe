@@ -1,5 +1,5 @@
 // オフライン用 Service Worker。ファイルを更新したら CACHE_VERSION を上げること。
-const CACHE_VERSION = 'compe-v2';
+const CACHE_VERSION = 'compe-v4';
 const ASSETS = [
   './',
   './index.html',

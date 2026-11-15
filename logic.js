@@ -215,13 +215,10 @@
     const rest = rows.filter((r) => r.id !== awards.bestGross);
     const net = orderWithTies(rest, byNet, (r) => `net|n${r.net}|h${r.hc}`, tieOrders);
     const M = net.ordered.length;
-    const positions = {}; // index -> award
+    const positions = {}; // index -> award（優勝・2位・3位）
     if (M >= 1) positions[0] = 'win';
     if (M >= 2) positions[1] = 'second';
     if (M >= 3) positions[2] = 'third';
-    const boobyIndex = M - 2;
-    if (boobyIndex >= 3) positions[boobyIndex] = 'booby';
-    else if (M >= 2) notes.push('参加人数が少なく、ブービー賞が3位以内と重なるため、ブービー賞はありません。');
 
     for (const g of net.groups) {
       if (g.resolved) continue;
@@ -232,6 +229,33 @@
       }
     }
     for (const [idx, award] of Object.entries(positions)) awards[award] = net.ordered[idx].id;
+
+    // ブービー賞：最下位から2番目。そこが NET 同点なら、同点者のうち HC の最も低い人が受賞（要件 3-4）。
+    const boobyIndex = M - 2;
+    if (boobyIndex >= 3) {
+      const boobyNet = net.ordered[boobyIndex].net;
+      const top3 = new Set([awards.win, awards.second, awards.third]);
+      const sameNet = net.ordered.filter((r) => r.net === boobyNet && !top3.has(r.id));
+      const minHc = Math.min(...sameNet.map((r) => r.hc));
+      const lowest = sameNet.filter((r) => r.hc === minHc)
+        .sort((a, b) => a.name.localeCompare(b.name, 'ja') || String(a.id).localeCompare(String(b.id)));
+      if (lowest.length === 1) {
+        awards.booby = lowest[0].id;
+      } else {
+        // NET も HC も同じ → 幹事が決める（一番上に並べた人がブービー賞）
+        const ids = lowest.map((r) => String(r.id)).sort();
+        const key = `booby|n${boobyNet}|h${minHc}|` + ids.join(',');
+        const saved = tieOrders && tieOrders[key];
+        if (Array.isArray(saved) && saved.length === ids.length && saved.map(String).slice().sort().join(',') === ids.join(',')) {
+          awards.booby = lowest.find((r) => String(r.id) === String(saved[0])).id;
+        } else {
+          pendingTies.push({ key, kind: 'booby', awards: ['booby'], members: lowest, net: boobyNet, hc: minHc });
+          awards.booby = lowest[0].id;
+        }
+      }
+    } else if (M >= 2) {
+      notes.push('参加人数が少なく、ブービー賞が3位以内と重なるため、ブービー賞はありません。');
+    }
 
     // 3. 全員が対象の賞
     for (const r of rows) {

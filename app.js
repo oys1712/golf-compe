@@ -357,9 +357,12 @@
   let tieDraft = {};
 
   function visibleTies(result) {
-    // ベスグロの同点を先に決める（誰を除くかで NET 側の同点が変わるため）
-    const g = result.pendingTies.filter((t) => t.kind === 'gross');
-    return g.length ? g : result.pendingTies;
+    // ベスグロ → 優勝〜3位 → ブービー の順に決める（前の決定で後ろの候補が変わるため）
+    for (const kind of ['gross', 'net', 'booby']) {
+      const list = result.pendingTies.filter((t) => t.kind === kind);
+      if (list.length) return list;
+    }
+    return [];
   }
 
   function viewTie() {
@@ -377,7 +380,7 @@
         const what = t.awards.map((a) => L.AWARD_LABELS[a]).join('・');
         const cond = t.kind === 'gross' ? `グロス ${t.gross}・HC ${t.hc}` : `NET ${t.net}・HC ${t.hc}`;
         return `<div class="card">
-          <b>${esc(what)} の判定</b><div class="muted">${esc(cond)} で同じ</div>
+          <b>${esc(what)} の判定</b><div class="muted">${esc(cond)} で同じ${t.kind === 'booby' ? '（一番上の人がブービー賞）' : ''}</div>
           <ol class="tie-list">${ids.map((id, i) => `
             <li><span class="pos">${i + 1}</span><span class="name">${esc(nameOf.get(id) || id)}</span>
               <button type="button" data-action="tie-move" data-key="${esc(t.key)}" data-index="${i}" data-delta="-1" ${i === 0 ? 'disabled' : ''} aria-label="上へ">↑</button>
