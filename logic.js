@@ -38,28 +38,48 @@
     return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
   }
 
-  /** 保存データの設定を既定値で補完する */
+  /** 設定値の許容範囲（設定画面・復元ファイル・保存データで共通） */
+  const SETTING_RANGES = {
+    points: [0, 100],
+    hcRatePercent: [0, 100],
+    netBelow: [1, 200],
+    minus: [0, 50],
+    seventiesMax: [1, 200],
+    competitionNameMax: 30,
+  };
+
+  /** 保存データの設定を既定値で補完する（範囲外・型違いの値は既定値にする） */
   function normalizeSettings(s) {
     const d = cloneDefaults();
     if (!s || typeof s !== 'object') return d;
     const out = d;
-    if (typeof s.competitionName === 'string') out.competitionName = s.competitionName;
+    const R = SETTING_RANGES;
+    const intIn = (v, [min, max]) => Number.isInteger(v) && v >= min && v <= max;
+    if (typeof s.competitionName === 'string' && s.competitionName.trim()) {
+      out.competitionName = s.competitionName.trim().slice(0, R.competitionNameMax);
+    }
     for (const k of Object.keys(d.points)) {
-      if (s.points && isFiniteNumber(s.points[k])) out.points[k] = Number(s.points[k]);
+      const v = s.points && s.points[k];
+      if (isFiniteNumber(v) && v >= R.points[0] && v <= R.points[1] && hasAtMost2Decimals(v)) out.points[k] = v;
     }
     for (const k of Object.keys(d.hcRatePercent)) {
-      if (s.hcRatePercent && Number.isInteger(s.hcRatePercent[k])) out.hcRatePercent[k] = s.hcRatePercent[k];
+      if (s.hcRatePercent && intIn(s.hcRatePercent[k], R.hcRatePercent)) out.hcRatePercent[k] = s.hcRatePercent[k];
     }
-    if (s.winBonus) {
-      if (Number.isInteger(s.winBonus.netBelow)) out.winBonus.netBelow = s.winBonus.netBelow;
-      if (Number.isInteger(s.winBonus.minus)) out.winBonus.minus = s.winBonus.minus;
+    if (s.winBonus && typeof s.winBonus === 'object') {
+      if (intIn(s.winBonus.netBelow, R.netBelow)) out.winBonus.netBelow = s.winBonus.netBelow;
+      if (intIn(s.winBonus.minus, R.minus)) out.winBonus.minus = s.winBonus.minus;
     }
-    if (Number.isInteger(s.seventiesMax)) out.seventiesMax = s.seventiesMax;
+    if (intIn(s.seventiesMax, R.seventiesMax)) out.seventiesMax = s.seventiesMax;
     return out;
   }
 
   function isFiniteNumber(v) {
     return typeof v === 'number' && Number.isFinite(v);
+  }
+
+  /** ポイントは小数2桁まで（3桁以上だと合計と内訳の和がずれるため） */
+  function hasAtMost2Decimals(v) {
+    return Math.abs(v * 100 - Math.round(v * 100)) < 1e-6;
   }
 
   function isNonNegInt(v) {
@@ -167,22 +187,16 @@
   }
 
   /**
-   * 幹事が順番を決めた同点の組は、その順番で上下を付ける比較関数にする。
-   * 決めていない同点は 0（同順位）のまま。
+   * 表示用の比較関数：(スコア, HC, 幹事が決めた組内の順番) の辞書式比較。
+   * 組に入っていない人の順番は 0 とする。同じ (スコア, HC) の組は1つしかないので推移的になる。
    */
   function withResolvedOrder(cmp, groups) {
-    const pos = new Map(); // id -> { key, index }
+    const index = new Map(); // id -> 組内の順番
     for (const g of groups) {
       if (!g.resolved) continue;
-      g.members.forEach((m, i) => pos.set(m.id, { key: g.key, index: i }));
+      g.members.forEach((m, i) => index.set(m.id, i));
     }
-    return (a, b) => {
-      const c = cmp(a, b);
-      if (c) return c;
-      const pa = pos.get(a.id);
-      const pb = pos.get(b.id);
-      return pa && pb && pa.key === pb.key ? pa.index - pb.index : 0;
-    };
+    return (a, b) => cmp(a, b) || (index.get(a.id) || 0) - (index.get(b.id) || 0);
   }
 
   /**
@@ -195,6 +209,7 @@
     const s = normalizeSettings(settings);
     const rows = players.map((p) => ({ ...p, net: p.gross - p.hc }));
     const pendingTies = [];
+    const appliedTies = []; // 今回の判定で実際に使った同点指定のキー
     const awards = {
       bestGross: null, win: null, second: null, third: null, booby: null,
       seventies: [], birdie: [], nearPin: [], driving: [],
@@ -208,12 +223,23 @@
       if (g0 && !g0.resolved) {
         pendingTies.push({ key: g0.key, kind: 'gross', awards: ['bestGross'], members: g0.members, gross: g0.members[0].gross, hc: g0.members[0].hc });
       }
+      if (g0 && g0.resolved) appliedTies.push(g0.key);
       awards.bestGross = gross.ordered[0].id;
+    }
+
+    // ベスグロの同点（3人以上）で並べた順番は、残った人たちの NET 同点にもそのまま使う（二度聞かない）。
+    // グロスも HC も同じ人たちは NET も同じなので、残りの NET 同点の組はちょうどこの人たちになる。
+    let netTieOrders = tieOrders || {};
+    const gTop = gross.groups.find((g) => g.start === 0);
+    if (gTop && gTop.resolved && gTop.members.length >= 3) {
+      const restIds = gTop.members.slice(1).map((m) => String(m.id));
+      const r1 = gTop.members[1];
+      netTieOrders = { ...netTieOrders, [`net|n${r1.net}|h${r1.hc}|` + restIds.slice().sort().join(',')]: restIds };
     }
 
     // 2. ベスグロ受賞者を除いた NET 順位で 優勝・2位・3位・ブービー
     const rest = rows.filter((r) => r.id !== awards.bestGross);
-    const net = orderWithTies(rest, byNet, (r) => `net|n${r.net}|h${r.hc}`, tieOrders);
+    const net = orderWithTies(rest, byNet, (r) => `net|n${r.net}|h${r.hc}`, netTieOrders);
     const M = net.ordered.length;
     const positions = {}; // index -> award（優勝・2位・3位）
     if (M >= 1) positions[0] = 'win';
@@ -221,12 +247,11 @@
     if (M >= 3) positions[2] = 'third';
 
     for (const g of net.groups) {
-      if (g.resolved) continue;
       const involved = [];
       for (let k = g.start; k <= g.end; k++) if (positions[k]) involved.push(positions[k]);
-      if (involved.length) {
-        pendingTies.push({ key: g.key, kind: 'net', awards: involved, members: g.members, net: g.members[0].net, hc: g.members[0].hc });
-      }
+      if (!involved.length) continue;
+      if (g.resolved) appliedTies.push(g.key);
+      else pendingTies.push({ key: g.key, kind: 'net', awards: involved, members: g.members, net: g.members[0].net, hc: g.members[0].hc });
     }
     for (const [idx, award] of Object.entries(positions)) awards[award] = net.ordered[idx].id;
 
@@ -239,8 +264,14 @@
       const minHc = Math.min(...sameNet.map((r) => r.hc));
       const lowest = sameNet.filter((r) => r.hc === minHc)
         .sort((a, b) => a.name.localeCompare(b.name, 'ja') || String(a.id).localeCompare(String(b.id)));
+      // 同じ (NET, HC) の人たちの順番を優勝〜3位の判定ですでに決めていれば、その順番を使う（二度聞かない）
+      const lowestIds = new Set(lowest.map((r) => r.id));
+      const decided = net.groups.find((g) => g.resolved && lowest.every((r) => g.members.some((m) => m.id === r.id)));
       if (lowest.length === 1) {
         awards.booby = lowest[0].id;
+      } else if (decided) {
+        awards.booby = decided.members.find((m) => lowestIds.has(m.id)).id;
+        if (!appliedTies.includes(decided.key)) appliedTies.push(decided.key);
       } else {
         // NET も HC も同じ → 幹事が決める（一番上に並べた人がブービー賞）
         const ids = lowest.map((r) => String(r.id)).sort();
@@ -248,12 +279,14 @@
         const saved = tieOrders && tieOrders[key];
         if (Array.isArray(saved) && saved.length === ids.length && saved.map(String).slice().sort().join(',') === ids.join(',')) {
           awards.booby = lowest.find((r) => String(r.id) === String(saved[0])).id;
+          appliedTies.push(key);
         } else {
-          pendingTies.push({ key, kind: 'booby', awards: ['booby'], members: lowest, net: boobyNet, hc: minHc });
+          // ベスグロや優勝〜3位の同点が未決定なら、それを決めた後に改めて判定する（決め方次第で不要になるため）
+          if (!pendingTies.length) pendingTies.push({ key, kind: 'booby', awards: ['booby'], members: lowest, net: boobyNet, hc: minHc });
           awards.booby = lowest[0].id;
         }
       }
-    } else if (M >= 2) {
+    } else if (M >= 1) {
       notes.push('参加人数が少なく、ブービー賞が3位以内と重なるため、ブービー賞はありません。');
     }
 
@@ -316,11 +349,14 @@
       .map((r) => pointsById.get(r.id))
       .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name, 'ja'));
 
-    return { awards, points, hcUpdates, netTable, grossTable, pendingTies, notes, settings: s };
+    return { awards, points, hcUpdates, netTable, grossTable, pendingTies, appliedTies, notes, settings: s };
   }
 
+  /** HC が更新される賞 */
+  const HC_AWARDS = ['win', 'second', 'third'];
+
   return {
-    NEAR_PIN_MAX, DRIVING_MAX, BIRDIE_MAX, HC_MAX, DEFAULT_SETTINGS, AWARD_LABELS,
+    NEAR_PIN_MAX, DRIVING_MAX, BIRDIE_MAX, HC_MAX, DEFAULT_SETTINGS, AWARD_LABELS, SETTING_RANGES, HC_AWARDS,
     cloneDefaults, normalizeSettings, hcReduction, newHandicap, validate, computeResults,
   };
 });

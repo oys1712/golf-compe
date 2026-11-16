@@ -23,35 +23,138 @@
     return { members: [], settings: L.cloneDefaults(), current: null, last: null, lastBackupAt: null };
   }
 
-  function sanitizeState(d) {
+  const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const isDateStr = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const nonNegInt = (v, max) => (Number.isInteger(v) && v >= 0 && v <= max ? v : 0);
+
+  /** HC を整数に（古い形式の文字列 "10" なども受け付ける）。不正なら null */
+  function toHc(v) {
+    const n = typeof v === 'string' ? (/^\s*\d{1,2}\s*$/.test(toHalfWidth(v)) ? parseInt(toHalfWidth(v), 10) : NaN) : v;
+    return Number.isInteger(n) && n >= 0 && n <= L.HC_MAX ? n : null;
+  }
+
+  /**
+   * 前回の結果として表示できる形か。
+   * 復元ファイルは他人から受け取ることもあるため、表示に使う値の型をすべて確かめる。
+   */
+  function isValidResult(r) {
+    const int = (v) => Number.isInteger(v);
+    const num = (v) => typeof v === 'number' && Number.isFinite(v);
+    const str = (v) => typeof v === 'string';
+    const strList = (v) => Array.isArray(v) && v.every(str);
+    if (!(isObj(r) && isObj(r.awards) && isObj(r.settings))) return false;
+    if (!['netTable', 'grossTable', 'points', 'hcUpdates', 'notes'].every((k) => Array.isArray(r[k]))) return false;
+    const row = (p) => isObj(p) && str(p.id) && str(p.name) && int(p.rank) && int(p.net) && int(p.gross) && int(p.hc) && strList(p.awards);
+    if (!r.netTable.length || !r.netTable.every(row) || !r.grossTable.every(row)) return false;
+    if (!strList(r.notes)) return false;
+    if (!r.points.every((p) => isObj(p) && str(p.id) && str(p.name) && num(p.total)
+      && Array.isArray(p.items) && p.items.every((i) => isObj(i) && str(i.label) && num(i.points)))) return false;
+    if (!r.hcUpdates.every((u) => isObj(u) && str(u.id) && str(u.name) && L.HC_AWARDS.includes(u.award)
+      && ['oldHc', 'newHc', 'reduction', 'bonus', 'net'].every((k) => int(u[k])))) return false;
+    // 受賞者が順位表にいるか
+    const ids = new Set(r.netTable.map((p) => p.id));
+    const a = r.awards;
+    if (!['win', 'second', 'third', 'booby', 'bestGross'].every((k) => a[k] === null || a[k] === undefined || ids.has(a[k]))) return false;
+    if (!Array.isArray(a.seventies) || !a.seventies.every((id) => ids.has(id))) return false;
+    if (!['birdie', 'nearPin', 'driving'].every((k) => Array.isArray(a[k]) && a[k].every((e) => isObj(e) && ids.has(e.id) && int(e.count)))) return false;
+    return true;
+  }
+
+  /**
+   * 保存データ・復元ファイルを検査して、使える部分だけを取り出す。
+   * report.droppedMembers に、読み込めずに捨てたメンバー数を入れる。
+   */
+  function sanitizeState(d, report) {
     const s = emptyState();
-    if (!d || typeof d !== 'object') return s;
+    const rep = report || {};
+    rep.droppedMembers = 0;
+    if (!isObj(d)) return s;
     if (Array.isArray(d.members)) {
-      s.members = d.members
-        .filter((m) => m && typeof m.id === 'string' && typeof m.name === 'string' && Number.isInteger(m.hc) && m.hc >= 0)
-        .map((m) => ({ id: m.id, name: m.name, hc: m.hc }));
+      const seen = new Set();
+      for (const m of d.members) {
+        const hc = isObj(m) ? toHc(m.hc) : null;
+        const ok = isObj(m) && typeof m.id === 'string' && m.id && !seen.has(m.id)
+          && typeof m.name === 'string' && m.name.trim() && hc !== null;
+        if (!ok) { rep.droppedMembers++; continue; }
+        seen.add(m.id);
+        s.members.push({ id: m.id, name: m.name.trim().slice(0, 40), hc });
+      }
     }
     s.settings = L.normalizeSettings(d.settings);
     const c = d.current;
-    if (c && typeof c === 'object' && Array.isArray(c.participantIds)) {
+    if (isObj(c) && Array.isArray(c.participantIds)) {
+      const scores = {};
+      if (isObj(c.scores)) {
+        for (const [id, sc] of Object.entries(c.scores)) {
+          if (!isObj(sc)) continue;
+          scores[id] = {
+            gross: Number.isInteger(sc.gross) && sc.gross > 0 && sc.gross < 1000 ? sc.gross : null,
+            nearPin: nonNegInt(sc.nearPin, L.NEAR_PIN_MAX),
+            driving: nonNegInt(sc.driving, L.DRIVING_MAX),
+            birdie: nonNegInt(sc.birdie, L.BIRDIE_MAX),
+          };
+        }
+      }
+      const tieOrders = {};
+      if (isObj(c.tieOrders)) {
+        for (const [k, v] of Object.entries(c.tieOrders)) {
+          if (Array.isArray(v) && v.every((x) => typeof x === 'string')) tieOrders[k] = v.slice();
+        }
+      }
       s.current = {
-        date: typeof c.date === 'string' ? c.date : today(),
-        participantIds: c.participantIds.filter((x) => typeof x === 'string'),
-        scores: c.scores && typeof c.scores === 'object' ? c.scores : {},
-        tieOrders: c.tieOrders && typeof c.tieOrders === 'object' ? c.tieOrders : {},
+        date: isDateStr(c.date) ? c.date : today(),
+        participantIds: [...new Set(c.participantIds.filter((x) => typeof x === 'string'))],
+        scores,
+        tieOrders,
       };
     }
-    if (d.last && typeof d.last === 'object' && d.last.result) s.last = d.last;
-    if (typeof d.lastBackupAt === 'string') s.lastBackupAt = d.lastBackupAt;
+    const last = d.last;
+    if (isObj(last) && isDateStr(last.date) && isValidResult(last.result)) {
+      s.last = {
+        date: last.date,
+        competitionName: typeof last.competitionName === 'string' ? last.competitionName.slice(0, 30) : '',
+        confirmedAt: typeof last.confirmedAt === 'string' ? last.confirmedAt : '',
+        result: { ...last.result, settings: L.normalizeSettings(last.result.settings) },
+      };
+    }
+    if (typeof d.lastBackupAt === 'string' && !Number.isNaN(Date.parse(d.lastBackupAt))) s.lastBackupAt = d.lastBackupAt;
     return s;
   }
 
+  let loadProblem = null; // 'corrupt'（保存データが壊れていた）| 'dropped'（一部のメンバーを読めなかった）
+
   function load() {
+    let raw = null;
     try {
-      const raw = localStorage.getItem(STORE_KEY);
-      return raw ? sanitizeState(JSON.parse(raw)) : emptyState();
+      raw = localStorage.getItem(STORE_KEY);
     } catch (e) {
       storageOK = false;
+      return emptyState();
+    }
+    // 保存できるか確認（プライベートブラウズや容量不足では失敗する）。失敗しても読めたデータは使う
+    try {
+      localStorage.setItem(STORE_KEY + '.probe', '1');
+      localStorage.removeItem(STORE_KEY + '.probe');
+    } catch (e) {
+      storageOK = false;
+    }
+    if (!raw) return emptyState();
+    try {
+      const parsed = JSON.parse(raw);
+      // JSON として読めても、このツールの形（members の配列を持つオブジェクト）でなければ壊れている
+      if (!isObj(parsed) || !Array.isArray(parsed.members)) throw new Error('unexpected shape');
+      const report = {};
+      const s = sanitizeState(parsed, report);
+      if (report.droppedMembers) {
+        // 次の保存で読めなかった人の分が消えるため、元のデータを退避しておく
+        try { localStorage.setItem(STORE_KEY + '.corrupt', raw); } catch (e2) { /* 退避できなくても起動は続ける */ }
+        loadProblem = { kind: 'dropped', count: report.droppedMembers };
+      }
+      return s;
+    } catch (e) {
+      // 壊れた元データは上書きせず、別のキーに退避しておく
+      try { localStorage.setItem(STORE_KEY + '.corrupt', raw); } catch (e2) { /* 退避できなくても起動は続ける */ }
+      loadProblem = { kind: 'corrupt' };
       return emptyState();
     }
   }
@@ -80,7 +183,14 @@
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
   function fmtDate(iso) {
-    return iso ? iso.replace(/-/g, '/') : '';
+    return typeof iso === 'string' ? iso.replace(/-/g, '/') : '';
+  }
+  /** ISO 日時を端末の現地時刻で「YYYY/MM/DD HH:MM」にする */
+  function fmtDateTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
   function toHalfWidth(s) {
     return String(s).replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
@@ -139,6 +249,7 @@
     '/tie': viewTie, '/result': viewResult, '/last': viewLast, '/settings': viewSettings, '/backup': viewBackup,
   };
   let lastRoute = null;
+  let membersFrom = '/'; // 名簿画面の「戻る」の行き先（参加者選択から来たら参加者選択へ戻す）
 
   function route() {
     const r = location.hash.replace(/^#/, '') || '/';
@@ -148,13 +259,28 @@
   function render() {
     const r = route();
     const routeChanged = r !== lastRoute;
+    const prevRoute = lastRoute;
     lastRoute = r;
     if (routeChanged) {
+      if (r === '/members') membersFrom = prevRoute === '/select' && selectDraft ? '/select' : '/';
       if (r === '/') selectDraft = null; // ホームに戻ったら未確定の参加者選択は捨てる
       if (r !== '/members') editingId = null;
+      closeOverlay(); // 画像の表示は画面を移ったら閉じる
     }
     $back.hidden = r === '/';
-    const out = VIEWS[r]();
+    let out;
+    try {
+      out = VIEWS[r]();
+    } catch (e) {
+      // どの画面で失敗しても、操作不能にならないよう逃げ道を出す
+      console.error(e);
+      out = {
+        title: 'エラー',
+        html: `<div class="banner error">画面を表示できませんでした（${esc(e && e.message ? e.message : e)}）。</div>
+          <button class="btn" data-action="nav" data-href="/">ホームへ</button>
+          <button class="btn" data-action="nav" data-href="/backup">バックアップ・復元へ</button>`,
+      };
+    }
     if (out === undefined) return; // リダイレクト済み
     $title.textContent = out.title;
     $app.innerHTML = out.html;
@@ -162,14 +288,25 @@
     if (out.after) out.after();
   }
 
-  $back.addEventListener('click', () => go(PARENT[route()] || '/'));
+  $back.addEventListener('click', () => {
+    const r = route();
+    if (r === '/select' && selectDraftDirty() && !confirm('開催日・参加者の変更はまだ反映されていません。変更を破棄して戻りますか？')) return;
+    go(r === '/members' ? membersFrom : PARENT[r] || '/');
+  });
   window.addEventListener('hashchange', render);
 
   // ---------------------------------------------------------------- ホーム
   function viewHome() {
     const cur = state.current;
     const banners = [];
-    if (!storageOK) banners.push(`<div class="banner error">この端末ではデータを保存できません（プライベートブラウズ等）。閉じると入力内容が消えます。</div>`);
+    if (!storageOK) banners.push(`<div class="banner error">この端末にデータを保存できません（プライベートブラウズ、または端末の空き容量不足）。このままアプリを閉じると、入力内容が消えます。</div>`);
+    if (loadProblem && loadProblem.kind === 'corrupt') {
+      banners.push(`<div class="banner error">保存データが壊れていたため読み込めませんでした（元のデータは端末内に退避済みです）。<a href="#/backup">バックアップから復元</a>してください。
+        <br><button class="btn" data-action="dismiss-load-problem" style="margin:8px 0 0">このメッセージを閉じる</button></div>`);
+    } else if (loadProblem && loadProblem.kind === 'dropped') {
+      banners.push(`<div class="banner warn">名簿のうち${loadProblem.count}人分のデータが壊れていたため、読み込めませんでした（元のデータは端末内に退避済みです）。
+        <br><button class="btn" data-action="dismiss-load-problem" style="margin:8px 0 0">このメッセージを閉じる</button></div>`);
+    }
     if (state.members.length && (!state.lastBackupAt || daysSince(state.lastBackupAt) > BACKUP_REMIND_DAYS)) {
       banners.push(`<div class="banner warn">${state.lastBackupAt ? `最後のバックアップから${Math.floor(daysSince(state.lastBackupAt))}日経っています。` : 'まだバックアップがありません。'}
         端末のデータが消えた場合に備えて、<a href="#/backup">バックアップ</a>を書き出してください。</div>`);
@@ -184,7 +321,7 @@
         <h2>準備・管理</h2>
         <button class="btn" data-action="nav" data-href="/members">名簿 <span class="sub">${state.members.length}人</span></button>
         <button class="btn" data-action="nav" data-href="/settings">ルール設定</button>
-        <button class="btn" data-action="nav" data-href="/backup">バックアップ・復元 <span class="sub">${state.lastBackupAt ? esc(fmtDate(state.lastBackupAt.slice(0, 10))) : '未実施'}</span></button>
+        <button class="btn" data-action="nav" data-href="/backup">バックアップ・復元 <span class="sub">${state.lastBackupAt ? esc(fmtDateTime(state.lastBackupAt).slice(0, 10)) : '未実施'}</span></button>
       </div>`;
     return { title: state.settings.competitionName || 'コンペ幹事サポート', html };
   }
@@ -198,7 +335,7 @@
       <li><form data-form="member-edit" data-id="${esc(mem.id)}" style="width:100%" autocomplete="off" novalidate>
         <div class="settings-grid" style="grid-template-columns:2fr 1fr">
           <label class="field">氏名<input type="text" name="name" maxlength="20" value="${esc(mem.name)}" required></label>
-          <label class="field">HC<input type="text" name="hc" inputmode="numeric" pattern="[0-9]*" maxlength="2" value="${mem.hc}" required></label>
+          <label class="field">HC<input type="text" name="hc" inputmode="numeric" value="${mem.hc}" required></label>
         </div>
         <div class="btn-row">
           <button type="submit" class="btn primary">保存</button>
@@ -212,7 +349,7 @@
       <form class="card" data-form="member-add" autocomplete="off" novalidate>
         <div class="settings-grid" style="grid-template-columns:2fr 1fr">
           <label class="field">氏名<input type="text" name="name" maxlength="20" required></label>
-          <label class="field">HC（整数）<input type="text" name="hc" inputmode="numeric" pattern="[0-9]*" maxlength="2" required></label>
+          <label class="field">HC（整数）<input type="text" name="hc" inputmode="numeric" required></label>
         </div>
         <button class="btn primary" type="submit">名簿に追加</button>
       </form>
@@ -231,14 +368,23 @@
   }
 
   // ---------------------------------------------------------------- 参加者選択
-  let selectDraft = null; // { date, ids:Set, fresh }
+  let selectDraft = null; // { date, ids:Set, fresh, initKey }
+
+  const draftKey = (date, ids) => `${date}|${[...ids].sort().join(',')}`;
+
+  function makeSelectDraft(date, ids, fresh) {
+    return { date, ids: new Set(ids), fresh, initKey: draftKey(date, ids) };
+  }
 
   function ensureSelectDraft() {
     if (selectDraft) return;
     const cur = state.current;
-    selectDraft = cur
-      ? { date: cur.date, ids: new Set(cur.participantIds), fresh: false }
-      : { date: today(), ids: new Set(), fresh: true };
+    selectDraft = cur ? makeSelectDraft(cur.date, cur.participantIds, false) : makeSelectDraft(today(), [], true);
+  }
+
+  /** 参加者選択画面で、開催日や参加者を変えたまま確定していないか */
+  function selectDraftDirty() {
+    return !!selectDraft && draftKey(selectDraft.date, selectDraft.ids) !== selectDraft.initKey;
   }
 
   function viewSelect() {
@@ -287,9 +433,9 @@
   function stepHtml(p, key, label) {
     return `<div class="cell">${label}
       <div class="step" data-id="${esc(p.id)}" data-key="${key}">
-        <button type="button" data-action="step" data-delta="-1" aria-label="${p.name}の${label}を1減らす">−</button>
+        <button type="button" data-action="step" data-delta="-1" aria-label="${esc(p.name)}の${label}を1減らす">−</button>
         <output>${p[key]}</output>
-        <button type="button" data-action="step" data-delta="1" aria-label="${p.name}の${label}を1増やす">＋</button>
+        <button type="button" data-action="step" data-delta="1" aria-label="${esc(p.name)}の${label}を1増やす">＋</button>
       </div></div>`;
   }
 
@@ -304,10 +450,10 @@
       ${players.map((p) => `
         <div class="card player">
           <div class="player-head"><span class="name">${esc(p.name)}</span>
-            <span class="meta">HC ${p.hc}・NET <span id="net-${esc(p.id)}">${p.gross === null ? '—' : p.gross - p.hc}</span></span></div>
+            <span class="meta">HC ${esc(p.hc)}・NET <span id="net-${esc(p.id)}">${p.gross === null ? '—' : p.gross - p.hc}</span></span></div>
           <div class="grid">
             <div class="cell">グロス
-              <input type="text" class="gross-input" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off"
+              <input type="text" class="gross-input" inputmode="numeric" autocomplete="off"
                 data-input="gross" data-id="${esc(p.id)}" value="${p.gross === null ? '' : p.gross}" aria-label="${esc(p.name)}のグロス"></div>
             ${stepHtml(p, 'nearPin', 'ニアピン')}
             ${stepHtml(p, 'driving', 'ドラコン')}
@@ -372,7 +518,13 @@
     const ties = visibleTies(result);
     if (!ties.length) { location.replace('#/result'); return; }
     for (const t of ties) if (!tieDraft[t.key]) tieDraft[t.key] = t.members.map((m) => m.id);
+    // 同名の人がいるときは、名簿での登録順を添えて区別する
     const nameOf = new Map(result.netTable.map((r) => [r.id, r.name]));
+    const nameCount = {};
+    for (const n of nameOf.values()) nameCount[n] = (nameCount[n] || 0) + 1;
+    for (const [id, n] of nameOf) {
+      if (nameCount[n] > 1) nameOf.set(id, `${n}（名簿の${state.members.findIndex((m) => m.id === id) + 1}番目）`);
+    }
     const html = `
       <div class="banner info">スコアも HC も同じ人がいて、賞が決まりません。コンペのルール（じゃんけん等）で決めた順に、<b>上位の人が上</b>になるよう並べてください。</div>
       ${ties.map((t) => {
@@ -432,9 +584,9 @@
     const s = r.settings;
     const tags = (list) => list.map((x) => `<span class="tag">${esc(x)}</span>`).join('');
     const netRows = r.netTable.map((p) => `
-      <tr class="${p.isBestGross ? 'bg' : ''}"><td>${p.rank}</td><td class="l">${esc(p.name)}</td><td>${p.net}</td><td>${p.gross}</td><td>${p.hc}</td><td class="l">${tags(p.awards)}</td></tr>`).join('');
+      <tr class="${p.isBestGross ? 'bg' : ''}"><td>${esc(p.rank)}</td><td class="l">${esc(p.name)}</td><td>${esc(p.net)}</td><td>${esc(p.gross)}</td><td>${esc(p.hc)}</td><td class="l">${tags(p.awards)}</td></tr>`).join('');
     const grossRows = r.grossTable.map((p) => `
-      <tr><td>${p.rank}</td><td class="l">${esc(p.name)}</td><td>${p.gross}</td><td>${p.hc}</td><td>${p.net}</td><td class="l">${tags(p.awards)}</td></tr>`).join('');
+      <tr><td>${esc(p.rank)}</td><td class="l">${esc(p.name)}</td><td>${esc(p.gross)}</td><td>${esc(p.hc)}</td><td>${esc(p.net)}</td><td class="l">${tags(p.awards)}</td></tr>`).join('');
     return `
       ${r.notes.map((n) => `<div class="banner warn">${esc(n)}</div>`).join('')}
       <h2>各賞</h2>
@@ -444,15 +596,15 @@
       <div class="table-wrap"><table>
         <thead><tr><th class="l">氏名</th><th>合計</th><th class="l">内訳</th></tr></thead>
         <tbody>${r.points.map((p) => `
-          <tr><td class="l">${esc(p.name)}</td><td><b>${fmtPt(p.total)}</b></td>
-            <td class="l wrap">${p.items.length ? p.items.map((i) => `${esc(i.label)} ${fmtPt(i.points)}pt`).join('、') : '<span class="muted">—</span>'}</td></tr>`).join('')}
+          <tr><td class="l">${esc(p.name)}</td><td><b>${esc(fmtPt(p.total))}</b></td>
+            <td class="l wrap">${p.items.length ? p.items.map((i) => `${esc(i.label)} ${esc(fmtPt(i.points))}pt`).join('、') : '<span class="muted">—</span>'}</td></tr>`).join('')}
         </tbody></table></div>
 
       <h2>ハンディキャップ更新</h2>
       ${r.hcUpdates.length ? `<div class="table-wrap"><table>
         <thead><tr><th class="l">賞</th><th class="l">氏名</th><th>旧HC</th><th>新HC</th><th class="l">計算</th></tr></thead>
         <tbody>${r.hcUpdates.map((u) => `
-          <tr><td class="l">${L.AWARD_LABELS[u.award]}</td><td class="l">${esc(u.name)}</td><td>${u.oldHc}</td><td><b>${u.newHc}</b></td>
+          <tr><td class="l">${L.AWARD_LABELS[u.award]}</td><td class="l">${esc(u.name)}</td><td>${esc(u.oldHc)}</td><td><b>${esc(u.newHc)}</b>${u.newHc === u.oldHc ? '<br><span class="muted small">変化なし</span>' : ''}</td>
             <td class="l wrap">${esc(hcCalcText(u, s))}</td></tr>`).join('')}
         </tbody></table></div>` : '<p class="muted">なし</p>'}
 
@@ -466,7 +618,7 @@
           ? `<thead><tr><th>順位</th><th class="l">氏名</th><th>NET</th><th>グロス</th><th>HC</th><th class="l">賞</th></tr></thead><tbody>${netRows}</tbody>`
           : `<thead><tr><th>順位</th><th class="l">氏名</th><th>グロス</th><th>HC</th><th>NET</th><th class="l">賞</th></tr></thead><tbody>${grossRows}</tbody>`}
       </table></div>
-      <p class="muted small">${resultTab === 'net' ? '色付きの行はベストグロス受賞者です（優勝〜3位・ブービーの判定からは除外）。' : ''}スコアも HC も同じ人は同順位で表示しています。</p>
+      <p class="muted small">${resultTab === 'net' ? '色付きの行はベストグロス受賞者です（優勝〜3位・ブービーの判定からは除外）。' : ''}スコアも HC も同じ人は同順位で表示しています（同点の順番を決めた場合はその順）。</p>
 
       <h2>結果を共有</h2>
       <button class="btn" data-action="copy-text">結果をテキストでコピー</button>
@@ -479,7 +631,7 @@
     const { result } = computeCurrent();
     if (!result) { location.replace('#/input'); return; }
     if (result.pendingTies.length) { location.replace('#/tie'); return; }
-    const hasTie = Object.keys(state.current.tieOrders).length > 0;
+    const hasTie = result.appliedTies.length > 0; // 今回の判定で実際に使った同点指定があるときだけ
     const html = `
       <div class="banner info">まだ確定していません。内容を確認して、下の「確定」を押すと新しい HC が名簿に反映されます。</div>
       ${resultBodyHtml(result)}
@@ -528,17 +680,21 @@
     list('ドラコン', a.driving.map((e) => `${by.get(e.id).name}×${e.count}`));
     lines.push('');
     lines.push('【獲得ポイント】');
+    // 受賞があった人は、ポイントが 0（設定で 0pt にした賞など）でも載せる
     for (const p of r.points) {
-      if (p.total > 0) lines.push(`${p.name}　${fmtPt(p.total)}pt（${p.items.map((i) => `${i.label} ${fmtPt(i.points)}pt`).join('、')}）`);
+      if (p.items.length) lines.push(`${p.name}　${fmtPt(p.total)}pt（${p.items.map((i) => `${i.label} ${fmtPt(i.points)}pt`).join('、')}）`);
     }
-    if (!r.points.some((p) => p.total > 0)) lines.push('なし');
+    if (!r.points.some((p) => p.items.length)) lines.push('なし');
     lines.push('');
     lines.push('【ハンディキャップ更新】');
-    if (r.hcUpdates.length) for (const u of r.hcUpdates) lines.push(`${u.name}　${u.oldHc} → ${u.newHc}（${L.AWARD_LABELS[u.award]}）`);
+    if (r.hcUpdates.length) for (const u of r.hcUpdates) lines.push(`${u.name}　${u.oldHc} → ${u.newHc}（${L.AWARD_LABELS[u.award]}${u.newHc === u.oldHc ? '・変化なし' : ''}）`);
     else lines.push('なし');
     lines.push('');
     lines.push('【NET順位】');
     for (const p of r.netTable) lines.push(`${p.rank}. ${p.name}　NET ${p.net}（${p.gross}−${p.hc}）${p.isBestGross ? '　※ベスグロ' : ''}`);
+    lines.push('');
+    lines.push('【グロス順位】');
+    for (const p of r.grossTable) lines.push(`${p.rank}. ${p.name}　グロス ${p.gross}（HC ${p.hc}）${p.id === r.awards.bestGross ? '　※ベスグロ' : ''}`);
     return lines.join('\n');
   }
 
@@ -565,18 +721,35 @@
       bodyLines.push({ text: buf, st });
     });
     const HEADER = 140;
-    canvas.width = W;
-    canvas.height = HEADER + PAD / 2 + bodyLines.reduce((h, l) => h + (l.gap ? LH / 2 : LH), 0) + PAD;
+    const H = HEADER + PAD / 2 + bodyLines.reduce((h, l) => h + (l.gap ? LH / 2 : LH), 0) + PAD;
+    // iPhone の Canvas は約1670万画素が上限。参加者が多く超える場合は全体を縮小して描く
+    const MAX_AREA = 16000000;
+    const scale = W * H > MAX_AREA ? Math.sqrt(MAX_AREA / (W * H)) : 1;
+    canvas.width = Math.floor(W * scale);
+    canvas.height = Math.floor(H * scale);
+    ctx.scale(scale, scale); // 以降は縮小前の座標で描く（大きさを変えると描画設定が消えるため、その後に設定する）
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, W, canvas.height);
+    ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#1b6b44';
     ctx.fillRect(0, 0, W, HEADER);
     ctx.textBaseline = 'middle';
     // 見出しは幅に収まるまで文字を小さくする
+    const maxW = W - PAD * 2;
     let size = 44;
-    do { ctx.font = `bold ${size}px ${FONT}`; size -= 2; } while (size > 20 && ctx.measureText(src[0]).width > W - PAD * 2);
+    ctx.font = `bold ${size}px ${FONT}`;
+    while (size > 24 && ctx.measureText(src[0]).width > maxW) {
+      size -= 2;
+      ctx.font = `bold ${size}px ${FONT}`;
+    }
+    // 最小サイズでも収まらなければ末尾を「…」で省略する
+    let title = src[0];
+    if (ctx.measureText(title).width > maxW) {
+      const chars = [...title];
+      while (chars.length && ctx.measureText(chars.join('') + '…').width > maxW) chars.pop();
+      title = chars.join('') + '…';
+    }
     ctx.fillStyle = '#ffffff';
-    ctx.fillText(src[0], PAD, HEADER / 2);
+    ctx.fillText(title, PAD, HEADER / 2);
     let y = HEADER + PAD / 2;
     for (const l of bodyLines) {
       if (l.gap) { y += LH / 2; continue; }
@@ -603,7 +776,13 @@
       <a class="btn" href="${dataUrl}" download="${esc(filename)}">ダウンロード</a>
       <button type="button" class="btn" id="overlayClose">閉じる</button>`;
     $overlay.hidden = false;
-    document.getElementById('overlayClose').addEventListener('click', () => { $overlay.hidden = true; $overlay.innerHTML = ''; });
+    document.getElementById('overlayClose').addEventListener('click', closeOverlay);
+  }
+
+  function closeOverlay() {
+    if ($overlay.hidden) return;
+    $overlay.hidden = true;
+    $overlay.innerHTML = '';
   }
 
   async function copyText(text) {
@@ -676,9 +855,9 @@
     const val = (n) => toHalfWidth(form.elements[n].value).trim();
     s.competitionName = form.elements.competitionName.value.trim() || L.DEFAULT_SETTINGS.competitionName;
     for (const [k, label] of POINT_FIELDS) {
-      const t = val('pt_' + k);
-      const v = Number(t);
-      if (t === '' || !Number.isFinite(v) || v < 0 || v > 100) errors.push(`ポイント「${label}」は 0〜100 の数で入力してください。`);
+      const t = val('pt_' + k).replace(/．/g, '.');
+      const v = /^\d+(\.\d{1,2})?$/.test(t) ? Number(t) : NaN;
+      if (!Number.isFinite(v) || v < 0 || v > 100) errors.push(`ポイント「${label}」は 0〜100 の数（小数は2桁まで）で入力してください（例：0.5）。`);
       else s.points[k] = v;
     }
     const int = (name, label, min, max, set) => {
@@ -703,9 +882,11 @@
     const html = `
       <div class="card">
         <p>名簿・ルール設定・入力中のコンペ・前回の結果を、1つのファイル（JSON）に書き出します。</p>
-        <p class="muted">最後のバックアップ：${state.lastBackupAt ? esc(state.lastBackupAt.slice(0, 16).replace('T', ' ')) : 'まだありません'}</p>
+        <p class="muted">最後のバックアップ：${state.lastBackupAt ? esc(fmtDateTime(state.lastBackupAt)) : 'まだありません'}</p>
         ${canShareFiles ? '<button class="btn primary" data-action="backup-share">書き出す（「ファイル」に保存・AirDrop など）</button>' : ''}
         <button class="btn ${canShareFiles ? '' : 'primary'}" data-action="backup-download">ダウンロードで書き出す</button>
+        ${downloadPending ? `<div class="banner warn">ダウンロードを開始しました。ファイルを保存できたことを確認してから、下のボタンを押してください（押すまでは「バックアップ済み」になりません）。
+          <button class="btn primary" data-action="backup-download-done" style="margin:8px 0 0">保存できた</button></div>` : ''}
       </div>
       <h2>復元</h2>
       <div class="card">
@@ -717,15 +898,19 @@
     return { title: 'バックアップ・復元', html };
   }
 
+  let downloadPending = false; // ダウンロード方式で書き出し、保存できたかの確認待ち
+
   function backupPayload() {
     const now = new Date();
     const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-    const data = { app: APP_ID, version: 1, exportedAt: now.toISOString(), data: state };
+    // ファイル内の「最後のバックアップ」はこの書き出しの日時にする（復元後に「未実施」と出ないように）
+    const data = { app: APP_ID, version: 1, exportedAt: now.toISOString(), data: { ...state, lastBackupAt: now.toISOString() } };
     return { json: JSON.stringify(data, null, 2), filename: `compe-backup-${stamp}.json` };
   }
 
   function markBackedUp() {
     state.lastBackupAt = new Date().toISOString();
+    downloadPending = false;
     save();
     render();
   }
@@ -733,26 +918,50 @@
   function restoreFrom(text) {
     let obj;
     try { obj = JSON.parse(text); } catch (e) { toast('ファイルを読み込めませんでした（JSON ではありません）。'); return; }
-    if (!obj || obj.app !== APP_ID || !obj.data || !Array.isArray(obj.data.members)) {
+    if (!isObj(obj) || obj.app !== APP_ID || !isObj(obj.data) || !Array.isArray(obj.data.members)) {
       toast('このツールのバックアップファイルではありません。');
       return;
     }
-    const next = sanitizeState(obj.data);
-    const msg = `バックアップ（${obj.exportedAt ? obj.exportedAt.slice(0, 10) : '日付不明'}・名簿${next.members.length}人）で、今のデータ（名簿${state.members.length}人）を置き換えます。よろしいですか？`;
+    const report = {};
+    const next = sanitizeState(obj.data, report);
+    const exportedAt = typeof obj.exportedAt === 'string' && !Number.isNaN(Date.parse(obj.exportedAt)) ? obj.exportedAt : null;
+    if (exportedAt && !next.lastBackupAt) next.lastBackupAt = exportedAt;
+    const msg = `バックアップ（${exportedAt ? fmtDateTime(exportedAt) : '日付不明'}・名簿${next.members.length}人）で、今のデータ（名簿${state.members.length}人）を置き換えます。`
+      + (report.droppedMembers ? `\n※ファイル内の${report.droppedMembers}人分は壊れているため読み込めません。` : '')
+      + '\nよろしいですか？';
     if (!confirm(msg)) return;
     state = next;
     selectDraft = null;
     tieDraft = {};
+    loadProblem = null;
+    downloadPending = false;
     save();
     toast('復元しました。');
     go('/');
   }
 
   // ---------------------------------------------------------------- 操作
+  let shareBusy = false; // 共有シートを開いている間などの二度押しを無視する
+  const SHARE_ACTIONS = ['copy-text', 'share-text', 'save-image', 'backup-share'];
+
   $app.addEventListener('click', async (ev) => {
     const el = ev.target.closest('[data-action]');
     if (!el || !$app.contains(el)) return;
     const act = el.dataset.action;
+    if (!SHARE_ACTIONS.includes(act)) { await onAction(el, act); return; }
+    if (shareBusy) return;
+    shareBusy = true;
+    try { await onAction(el, act); } finally { shareBusy = false; }
+  });
+
+  async function onAction(el, act) {
+    // 連打などで、前提の状態がもうない操作は無視して画面を描き直す
+    const NEEDS_CURRENT = ['step', 'calc', 'tie-move', 'tie-commit', 'reset-ties', 'confirm-result'];
+    const NEEDS_SELECT = ['select-all', 'select-none', 'select-commit'];
+    if ((NEEDS_CURRENT.includes(act) && !state.current) || (NEEDS_SELECT.includes(act) && !selectDraft)) {
+      render();
+      return;
+    }
 
     switch (act) {
       case 'nav':
@@ -761,7 +970,7 @@
 
       case 'new-compe': {
         if (state.current && !confirm(`入力中のコンペ（${fmtDate(state.current.date)}）があります。破棄して新しく始めますか？\n（参加者を選んで「スコア入力へ」を押すまでは、入力中のコンペは残ります）`)) return;
-        selectDraft = { date: today(), ids: new Set(), fresh: true };
+        selectDraft = makeSelectDraft(today(), [], true);
         go('/select');
         break;
       }
@@ -810,8 +1019,18 @@
         } else {
           const cur = state.current;
           cur.date = selectDraft.date || cur.date;
+          // 外した人のグロス・バーディーは残す（誤って外して戻したときに消えないように）。
+          // ニアピン・ドラコンは全体の本数に上限があるため、外した時点で 0 に戻す。
+          let cleared = 0;
+          for (const id of cur.participantIds) {
+            const sc = cur.scores[id];
+            if (ids.includes(id) || !sc) continue;
+            if (sc.nearPin || sc.driving) cleared++;
+            sc.nearPin = 0;
+            sc.driving = 0;
+          }
           cur.participantIds = ids;
-          for (const k of Object.keys(cur.scores)) if (!ids.includes(k)) delete cur.scores[k];
+          if (cleared) toast(`外した${cleared}人のニアピン・ドラコンを0本に戻しました。`);
         }
         tieDraft = {};
         selectDraft = null;
@@ -861,7 +1080,10 @@
       case 'tie-commit': {
         const { result } = computeCurrent();
         if (!result) return;
-        for (const t of visibleTies(result)) state.current.tieOrders[t.key] = tieDraft[t.key].slice();
+        const ties = visibleTies(result);
+        // 画面に表示していない同点（連打で次の同点に切り替わった直後など）は、見せずに決めない
+        if (!ties.length || ties.some((t) => !tieDraft[t.key])) { render(); return; }
+        for (const t of ties) state.current.tieOrders[t.key] = tieDraft[t.key].slice();
         tieDraft = {};
         save();
         go('/result');
@@ -903,7 +1125,7 @@
       case 'confirm-result': {
         const { result } = computeCurrent();
         if (!result || result.pendingTies.length) { render(); return; }
-        const changes = result.hcUpdates.map((u) => `・${u.name}：${u.oldHc} → ${u.newHc}`).join('\n') || '・なし';
+        const changes = result.hcUpdates.map((u) => `・${u.name}：${u.oldHc} → ${u.newHc}${u.newHc === u.oldHc ? '（変化なし）' : ''}`).join('\n') || '・なし';
         if (!confirm(`結果を確定します。\n名簿の HC を次のように更新します。\n${changes}\n\n確定後は入力内容を変更できません。よろしいですか？`)) return;
         for (const u of result.hcUpdates) {
           const m = state.members.find((x) => x.id === u.id);
@@ -954,36 +1176,57 @@
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
-        markBackedUp();
-        toast('書き出しました。');
+        // ダウンロードは成功したか分からないので、ユーザーが「保存できた」を押すまで記録しない
+        downloadPending = true;
+        render();
         break;
       }
+      case 'backup-download-done':
+        markBackedUp();
+        toast('バックアップ済みとして記録しました。');
+        break;
+      case 'dismiss-load-problem':
+        loadProblem = null;
+        render();
+        break;
       case 'restore-open':
         document.getElementById('restoreFile').click();
         break;
       default:
         break;
     }
-  });
+  }
+
+  /** グロス欄の値を半角数字3桁までに整えて保存する */
+  function onGrossInput(el) {
+    if (!state.current) return;
+    const digits = toHalfWidth(el.value).replace(/\D/g, '').slice(0, 3);
+    if (digits !== el.value) el.value = digits;
+    const v = digits === '' ? null : parseInt(digits, 10);
+    scoreOf(el.dataset.id).gross = v === 0 ? null : v;
+    el.classList.toggle('invalid', v === 0);
+    const hc = (state.members.find((m) => m.id === el.dataset.id) || {}).hc;
+    const netEl = document.getElementById('net-' + el.dataset.id);
+    if (netEl) netEl.textContent = v ? v - hc : '—';
+    save();
+    const c = document.getElementById('counters');
+    if (c) c.innerHTML = countersHtml(getPlayers(state.current));
+  }
 
   $app.addEventListener('input', (ev) => {
     const el = ev.target;
     const kind = el.dataset && el.dataset.input;
     if (kind === 'gross') {
-      const digits = toHalfWidth(el.value).replace(/\D/g, '').slice(0, 3);
-      if (digits !== el.value) el.value = digits;
-      const v = digits === '' ? null : parseInt(digits, 10);
-      scoreOf(el.dataset.id).gross = v === 0 ? null : v;
-      el.classList.toggle('invalid', v === 0);
-      const hc = (state.members.find((m) => m.id === el.dataset.id) || {}).hc;
-      const netEl = document.getElementById('net-' + el.dataset.id);
-      if (netEl) netEl.textContent = v ? v - hc : '—';
-      save();
-      const c = document.getElementById('counters');
-      if (c) c.innerHTML = countersHtml(getPlayers(state.current));
+      // 日本語入力の変換中に値を書き換えると数字が重複するため、確定（compositionend）を待つ
+      if (ev.isComposing) return;
+      onGrossInput(el);
     } else if (kind === 'sel-date') {
       selectDraft.date = el.value;
     }
+  });
+  $app.addEventListener('compositionend', (ev) => {
+    const el = ev.target;
+    if (el.dataset && el.dataset.input === 'gross') onGrossInput(el);
   });
 
   $app.addEventListener('change', (ev) => {
@@ -1021,6 +1264,8 @@
       if (!v) return;
       const m = state.members.find((x) => x.id === form.dataset.id);
       if (!m) return;
+      if (v.name !== m.name && state.members.some((x) => x.id !== m.id && x.name === v.name)
+        && !confirm(`「${v.name}」はすでに名簿にいます。同じ名前に変更しますか？`)) return;
       m.name = v.name;
       m.hc = v.hc;
       editingId = null;
@@ -1044,7 +1289,26 @@
 
   // ---------------------------------------------------------------- 起動
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname))) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    // 起動時にすでに Service Worker が動いていたか（初回インストール時は更新の案内を出さない）
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController) showUpdateBar();
+    });
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+      // ホーム画面のアプリは閉じずに再開されることが多いため、表に戻るたびに新しい版を確認する
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    }).catch(() => {});
+  }
+
+  /** 新しい版に切り替わったことを知らせる（入力内容は保存済みなので、再読み込みしても消えない） */
+  function showUpdateBar() {
+    const bar = document.getElementById('updateBar');
+    if (!bar || !bar.hidden) return;
+    bar.hidden = false;
+    document.getElementById('updateReload').addEventListener('click', () => location.reload());
+    document.getElementById('updateLater').addEventListener('click', () => { bar.hidden = true; });
   }
   if (navigator.storage && navigator.storage.persist) {
     navigator.storage.persist().catch(() => {});

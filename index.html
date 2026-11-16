@@ -23,6 +23,11 @@
   <main id="app" tabindex="-1"></main>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <div id="overlay" class="overlay" hidden></div>
+  <div id="updateBar" class="update-bar" role="status" hidden>
+    <span>新しい版があります。</span>
+    <button type="button" id="updateReload">再読み込み</button>
+    <button type="button" id="updateLater" aria-label="あとで">あとで</button>
+  </div>
   <noscript>このツールを使うには JavaScript を有効にしてください。</noscript>
   <script src="logic.js"></script>
   <script src="app.js"></script>
