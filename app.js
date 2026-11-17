@@ -9,6 +9,9 @@
   const APP_ID = 'golf-compe-tool';
   const STORE_KEY = 'golfCompeTool.v1';
   const BACKUP_REMIND_DAYS = 30;
+  // アプリのバージョン表記（ホーム画面の下に表示）。
+  // バージョンを変えるときは、sw.js の CACHE_VERSION と両方を同じ表記にすること。
+  const APP_VERSION = 'Ver1.3';
 
   const $app = document.getElementById('app');
   const $title = document.getElementById('title');
@@ -26,6 +29,105 @@
   const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
   const isDateStr = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
   const nonNegInt = (v, max) => (Number.isInteger(v) && v >= 0 && v <= max ? v : 0);
+  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const isHcInt = (v) => Number.isInteger(v) && v >= 0 && v <= L.HC_MAX;
+  const isGross = (v) => Number.isInteger(v) && v > 0 && v <= L.GROSS_MAX;
+  const GROSS_TEXT_MAX = 20; // 不正なグロス入力を保存するときの文字数の上限
+
+  /**
+   * グロス欄の文字列を解釈する（要件メモ 10章「Ver1.3 の修正」）。
+   * 前後の空白は無視し、全角数字は半角として読む。値を削ったり切ったりはしない。
+   * 戻り値 { gross, text }：
+   * - 空欄・0 → { gross: null, text: null }（未入力）
+   * - 1〜999 の半角数字 → { gross: 数値, text: null }
+   * - それ以外（1000 以上、マイナス、小数点、文字など）→ { gross: null, text: 入力した文字列 }（不正な入力）。
+   *   長すぎる文字列は末尾を「…」にして保存する（「…」は数字でないので、切っても不正な入力のまま）。
+   */
+  function parseGross(str) {
+    const t = toHalfWidth(str).trim();
+    if (t === '') return { gross: null, text: null };
+    if (/^\d+$/.test(t)) {
+      const n = Number(t);
+      if (n === 0) return { gross: null, text: null }; // 0 は未入力として扱う
+      if (isGross(n)) return { gross: n, text: null };
+    }
+    return { gross: null, text: t.length > GROSS_TEXT_MAX ? t.slice(0, GROSS_TEXT_MAX - 1) + '…' : t };
+  }
+
+  /**
+   * 計算・入力チェックに渡すグロス。不正な入力（grossText）は null 以外の値にして、
+   * 「未入力」ではなく「正しくありません」のエラーにする（数字だけなら 1000 以上の数、それ以外は NaN）。
+   */
+  function grossForCheck(sc) {
+    if (typeof sc.grossText === 'string') return /^\d+$/.test(sc.grossText) ? Number(sc.grossText) : NaN;
+    return isGross(sc.gross) ? sc.gross : null;
+  }
+
+  /**
+   * 参加者ごとのスコア { id: {gross,nearPin,driving,birdie[,grossText]} } を検査して取り出す（形の合わない人は捨てる）。
+   * grossText はグロス欄の不正な入力（例："-85"）。アプリを閉じても「不正な入力」のまま残すために持つ。
+   */
+  function sanitizeScores(src) {
+    const out = [];
+    if (!isObj(src)) return {};
+    for (const [id, sc] of Object.entries(src)) {
+      if (!isObj(sc)) continue;
+      const g = typeof sc.grossText === 'string' ? parseGross(sc.grossText) : { gross: isGross(sc.gross) ? sc.gross : null, text: null };
+      out.push([id, {
+        gross: g.gross,
+        ...(g.text !== null ? { grossText: g.text } : {}),
+        nearPin: nonNegInt(sc.nearPin, L.NEAR_PIN_MAX),
+        driving: nonNegInt(sc.driving, L.DRIVING_MAX),
+        birdie: nonNegInt(sc.birdie, L.BIRDIE_MAX),
+      }]);
+    }
+    return Object.fromEntries(out); // id が "__proto__" でも普通のキーになるように
+  }
+
+  /** 同点の指定順 { key: [id,...] } を検査して取り出す */
+  function sanitizeTieOrders(src) {
+    if (!isObj(src)) return {};
+    return Object.fromEntries(Object.entries(src)
+      .filter(([, v]) => Array.isArray(v) && v.every((x) => typeof x === 'string'))
+      .map(([k, v]) => [k, v.slice()]));
+  }
+
+  /** 参加者ごとの当日 HC { id: HC } を検査して取り出す（0〜99 の整数だけ残す） */
+  function sanitizeHcMap(src) {
+    if (!isObj(src)) return {};
+    return Object.fromEntries(Object.entries(src).filter(([, v]) => isHcInt(v)));
+  }
+
+  /**
+   * 修正中の当日 HC（検査済み）が、前回の結果の参加者（順位表の全員）の分そろっているか（Ver1.3）。
+   * 修正中に追加した人（前回の結果にいない人）は当日 HC を持たないのが正しい（名簿の今の HC を使う）ので問わない。
+   * 名簿から人を削除しても当日 HC は消さないため、前回の参加者全員の分を求めてよい。
+   */
+  function hasAllDayHc(snap, result) {
+    return isObj(snap) && result.netTable.every((p) => own(snap, p.id) && isHcInt(snap[p.id]));
+  }
+
+  /**
+   * 前回の結果に保存した入力内容（確定時の参加者・スコア・同点の指定順・当日 HC）を検査する。
+   * 参加者が結果の順位表と一致し、全員のグロスと当日 HC がそろっているときだけ使う。
+   * 形が合わなければ null（修正するときは結果から復元する）。
+   */
+  function sanitizeLastInput(inp, result) {
+    if (!isObj(inp) || !Array.isArray(inp.participantIds)) return null;
+    const ids = inp.participantIds;
+    if (!ids.every((x) => typeof x === 'string') || new Set(ids).size !== ids.length) return null;
+    const tableIds = new Set(result.netTable.map((p) => p.id));
+    if (ids.length !== tableIds.size || !ids.every((id) => tableIds.has(id))) return null;
+    const scores = sanitizeScores(inp.scores);
+    const hc = sanitizeHcMap(inp.hc);
+    if (!ids.every((id) => own(scores, id) && scores[id].gross !== null && own(hc, id))) return null;
+    return {
+      participantIds: ids.slice(),
+      scores: Object.fromEntries(ids.map((id) => [id, scores[id]])),
+      tieOrders: sanitizeTieOrders(inp.tieOrders),
+      hc: Object.fromEntries(ids.map((id) => [id, hc[id]])),
+    };
+  }
 
   /** HC を整数に（古い形式の文字列 "10" なども受け付ける）。不正なら null */
   function toHc(v) {
@@ -43,20 +145,30 @@
     const str = (v) => typeof v === 'string';
     const strList = (v) => Array.isArray(v) && v.every(str);
     if (!(isObj(r) && isObj(r.awards) && isObj(r.settings))) return false;
+    const nonNeg = (v) => int(v) && v >= 0;
     if (!['netTable', 'grossTable', 'points', 'hcUpdates', 'notes'].every((k) => Array.isArray(r[k]))) return false;
-    const row = (p) => isObj(p) && str(p.id) && str(p.name) && int(p.rank) && int(p.net) && int(p.gross) && int(p.hc) && strList(p.awards);
+    // 順位表：グロスは 1〜999、HC は 0〜99 の整数、NET はグロス − HC（修正時は順位表から入力内容を復元するため、値の範囲まで確かめる）
+    const row = (p) => isObj(p) && str(p.id) && str(p.name) && int(p.rank) && p.rank >= 1
+      && isGross(p.gross) && isHcInt(p.hc) && p.net === p.gross - p.hc && strList(p.awards);
     if (!r.netTable.length || !r.netTable.every(row) || !r.grossTable.every(row)) return false;
     if (!strList(r.notes)) return false;
     if (!r.points.every((p) => isObj(p) && str(p.id) && str(p.name) && num(p.total)
       && Array.isArray(p.items) && p.items.every((i) => isObj(i) && str(i.label) && num(i.points)))) return false;
-    if (!r.hcUpdates.every((u) => isObj(u) && str(u.id) && str(u.name) && L.HC_AWARDS.includes(u.award)
-      && ['oldHc', 'newHc', 'reduction', 'bonus', 'net'].every((k) => int(u[k])))) return false;
-    // 受賞者が順位表にいるか
     const ids = new Set(r.netTable.map((p) => p.id));
+    const rowById = new Map(r.netTable.map((p) => [p.id, p]));
+    // HC 更新：旧 HC・新 HC は 0〜99 の整数（再確定で名簿に入れる値になるため）、引く量は 0 以上の整数。
+    // 本人が順位表にいて、旧 HC・NET が順位表の当日 HC・NET と一致すること（Ver1.3）
+    if (!r.hcUpdates.every((u) => isObj(u) && str(u.id) && str(u.name) && L.HC_AWARDS.includes(u.award)
+      && isHcInt(u.oldHc) && isHcInt(u.newHc) && nonNeg(u.reduction) && nonNeg(u.bonus) && int(u.net)
+      && ids.has(u.id) && rowById.get(u.id).hc === u.oldHc && rowById.get(u.id).net === u.net)) return false;
+    // 受賞者が順位表にいるか（賞の項目が欠けているものは、表示できないので使わない。受賞者なしは null）
     const a = r.awards;
-    if (!['win', 'second', 'third', 'booby', 'bestGross'].every((k) => a[k] === null || a[k] === undefined || ids.has(a[k]))) return false;
+    if (!['win', 'second', 'third', 'booby', 'bestGross'].every((k) => own(a, k) && (a[k] === null || ids.has(a[k])))) return false;
     if (!Array.isArray(a.seventies) || !a.seventies.every((id) => ids.has(id))) return false;
-    if (!['birdie', 'nearPin', 'driving'].every((k) => Array.isArray(a[k]) && a[k].every((e) => isObj(e) && ids.has(e.id) && int(e.count)))) return false;
+    // 本数は 1 以上、上限（ニアピン4・ドラコン2・バーディー18）以下
+    const countMax = { birdie: L.BIRDIE_MAX, nearPin: L.NEAR_PIN_MAX, driving: L.DRIVING_MAX };
+    if (!['birdie', 'nearPin', 'driving'].every((k) => Array.isArray(a[k])
+      && a[k].every((e) => isObj(e) && ids.has(e.id) && int(e.count) && e.count >= 1 && e.count <= countMax[k]))) return false;
     return true;
   }
 
@@ -81,33 +193,7 @@
       }
     }
     s.settings = L.normalizeSettings(d.settings);
-    const c = d.current;
-    if (isObj(c) && Array.isArray(c.participantIds)) {
-      const scores = {};
-      if (isObj(c.scores)) {
-        for (const [id, sc] of Object.entries(c.scores)) {
-          if (!isObj(sc)) continue;
-          scores[id] = {
-            gross: Number.isInteger(sc.gross) && sc.gross > 0 && sc.gross < 1000 ? sc.gross : null,
-            nearPin: nonNegInt(sc.nearPin, L.NEAR_PIN_MAX),
-            driving: nonNegInt(sc.driving, L.DRIVING_MAX),
-            birdie: nonNegInt(sc.birdie, L.BIRDIE_MAX),
-          };
-        }
-      }
-      const tieOrders = {};
-      if (isObj(c.tieOrders)) {
-        for (const [k, v] of Object.entries(c.tieOrders)) {
-          if (Array.isArray(v) && v.every((x) => typeof x === 'string')) tieOrders[k] = v.slice();
-        }
-      }
-      s.current = {
-        date: isDateStr(c.date) ? c.date : today(),
-        participantIds: [...new Set(c.participantIds.filter((x) => typeof x === 'string'))],
-        scores,
-        tieOrders,
-      };
-    }
+    // 前回の結果を先に読む（入力中のコンペが「前回の結果の修正」かどうかの確認に使うため）
     const last = d.last;
     if (isObj(last) && isDateStr(last.date) && isValidResult(last.result)) {
       s.last = {
@@ -116,6 +202,33 @@
         confirmedAt: typeof last.confirmedAt === 'string' ? last.confirmedAt : '',
         result: { ...last.result, settings: L.normalizeSettings(last.result.settings) },
       };
+      // 確定時の入力内容（Ver1.1 から保存。古いデータにはない）
+      const input = sanitizeLastInput(last.input, last.result);
+      if (input) s.last.input = input;
+      if (last.revised === true) s.last.revised = true; // 修正して再確定した結果
+    }
+    const c = d.current;
+    if (isObj(c) && Array.isArray(c.participantIds)) {
+      s.current = {
+        date: isDateStr(c.date) ? c.date : today(),
+        participantIds: [...new Set(c.participantIds.filter((x) => typeof x === 'string'))],
+        scores: sanitizeScores(c.scores),
+        tieOrders: sanitizeTieOrders(c.tieOrders),
+      };
+      // 前回の結果の修正中なら、修正する結果（確定日時）と当日 HC を持つ。
+      if (c.edit !== undefined && c.edit !== null) {
+        const snap = sanitizeHcMap(c.hcSnapshot);
+        if (isObj(c.edit) && typeof c.edit.of === 'string' && s.last && c.edit.of === s.last.confirmedAt
+          && hasAllDayHc(snap, s.last.result)) {
+          s.current.edit = { of: c.edit.of };
+          s.current.hcSnapshot = snap;
+        } else {
+          // 修正する結果が今の前回の結果と一致しない、または当日 HC が欠けている修正中のデータは捨てる。
+          // ふつうのコンペとして確定したり、欠けた人を名簿の（確定で減らした後の）HC で計算したりすると、
+          // 確定済みの HC からさらに減らしてしまうため（Ver1.3）。
+          s.current = null;
+        }
+      }
     }
     if (typeof d.lastBackupAt === 'string' && !Number.isNaN(Date.parse(d.lastBackupAt))) s.lastBackupAt = d.lastBackupAt;
     return s;
@@ -220,22 +333,47 @@
     return (Date.now() - new Date(iso).getTime()) / 86400000;
   }
 
-  /** 入力中コンペの参加者（名簿の最新の氏名・HC を使う） */
+  /** 入力中のコンペが、前回の結果の修正か */
+  function isEditing(cur) {
+    return !!(cur && cur.edit && state.last && cur.edit.of === state.last.confirmedAt);
+  }
+
+  /**
+   * 計算に使う HC。前回の結果の修正中は、そのコンペ当日の HC（確定前の HC）を使う
+   * （名簿の HC は確定で更新済みのため）。修正中に追加した人は名簿の今の HC。
+   */
+  function hcFor(cur, id, rosterHc) {
+    return cur && cur.hcSnapshot && own(cur.hcSnapshot, id) ? cur.hcSnapshot[id] : rosterHc;
+  }
+
+  /**
+   * 入力中コンペの参加者（名簿の最新の氏名を使う。HC は名簿の HC、修正中は当日の HC）。
+   * gross：未入力は null、不正な入力は null 以外の不正な値（入力チェックでエラーにする）。
+   * grossOk：グロスが 1〜999 の整数として入力済みか（カウンター・NET の表示に使う）。
+   */
   function getPlayers(cur) {
     const byId = new Map(state.members.map((m) => [m.id, m]));
     return cur.participantIds.filter((id) => byId.has(id)).map((id) => {
       const m = byId.get(id);
-      const sc = cur.scores[id] || {};
+      const sc = (own(cur.scores, id) && cur.scores[id]) || {};
+      const gross = grossForCheck(sc);
       return {
-        id, name: m.name, hc: m.hc,
-        gross: Number.isInteger(sc.gross) ? sc.gross : null,
+        id, name: m.name, hc: hcFor(cur, id, m.hc),
+        gross, grossOk: isGross(gross),
         nearPin: sc.nearPin || 0, driving: sc.driving || 0, birdie: sc.birdie || 0,
       };
     });
   }
+
+  /** スコア入力画面のグロス欄に表示する文字列（不正な入力は入力したまま表示する） */
+  function grossFieldText(cur, id) {
+    const sc = (own(cur.scores, id) && cur.scores[id]) || {};
+    if (typeof sc.grossText === 'string') return sc.grossText;
+    return isGross(sc.gross) ? String(sc.gross) : '';
+  }
   function scoreOf(id) {
     const cur = state.current;
-    if (!cur.scores[id]) cur.scores[id] = { gross: null, nearPin: 0, driving: 0, birdie: 0 };
+    if (!own(cur.scores, id)) cur.scores[id] = { gross: null, nearPin: 0, driving: 0, birdie: 0 };
     return cur.scores[id];
   }
 
@@ -311,7 +449,7 @@
       banners.push(`<div class="banner warn">${state.lastBackupAt ? `最後のバックアップから${Math.floor(daysSince(state.lastBackupAt))}日経っています。` : 'まだバックアップがありません。'}
         端末のデータが消えた場合に備えて、<a href="#/backup">バックアップ</a>を書き出してください。</div>`);
     }
-    const curInfo = cur ? `${fmtDate(cur.date)}・${getPlayers(cur).length}人` : '';
+    const curInfo = cur ? `${fmtDate(cur.date)}・${getPlayers(cur).length}人${isEditing(cur) ? '・修正中' : ''}` : '';
     const html = `
       ${banners.join('')}
       <div class="menu">
@@ -322,7 +460,8 @@
         <button class="btn" data-action="nav" data-href="/members">名簿 <span class="sub">${state.members.length}人</span></button>
         <button class="btn" data-action="nav" data-href="/settings">ルール設定</button>
         <button class="btn" data-action="nav" data-href="/backup">バックアップ・復元 <span class="sub">${state.lastBackupAt ? esc(fmtDateTime(state.lastBackupAt).slice(0, 10)) : '未実施'}</span></button>
-      </div>`;
+      </div>
+      <p class="app-version">${esc(APP_VERSION)}</p>`;
     return { title: state.settings.competitionName || 'コンペ幹事サポート', html };
   }
 
@@ -391,7 +530,10 @@
     ensureSelectDraft();
     const m = state.members;
     const n = m.filter((x) => selectDraft.ids.has(x.id)).length;
+    // 前回の結果の修正中（新しく始める途中でないとき）は、計算に使う当日の HC を表示する
+    const editCur = !selectDraft.fresh && isEditing(state.current) ? state.current : null;
     const html = `
+      ${editCur ? `<div class="banner info">前回の結果（${esc(fmtDate(state.last.date))}）を修正中です。HC はそのコンペ当日の値を表示しています（追加した人は名簿の今の HC）。</div>` : ''}
       <label class="field">開催日<input type="date" data-input="sel-date" value="${esc(selectDraft.date)}"></label>
       ${m.length ? `
         <div class="btn-row">
@@ -400,7 +542,7 @@
         </div>
         <ul class="list">${m.map((mem) => `
           <li><label><input type="checkbox" data-input="sel" data-id="${esc(mem.id)}" ${selectDraft.ids.has(mem.id) ? 'checked' : ''}>
-            <span class="name">${esc(mem.name)}</span><span class="hc">HC ${mem.hc}</span></label></li>`).join('')}
+            <span class="name">${esc(mem.name)}</span><span class="hc">HC ${esc(hcFor(editCur, mem.id, mem.hc))}</span></label></li>`).join('')}
         </ul>
         <p class="muted">名簿にいない人は、先に<a href="#/members">名簿</a>に追加してください。</p>`
       : `<div class="card empty">名簿にメンバーがいません。<br><br><button class="btn primary" data-action="nav" data-href="/members">名簿に追加する</button></div>`}
@@ -422,7 +564,7 @@
   function countersHtml(players) {
     const np = players.reduce((a, p) => a + p.nearPin, 0);
     const dr = players.reduce((a, p) => a + p.driving, 0);
-    const done = players.filter((p) => p.gross !== null).length;
+    const done = players.filter((p) => p.grossOk).length; // 不正な入力は「入力済み」に数えない
     const cls = (v, max) => (v > max ? 'over' : v === max ? 'full' : '');
     return `
       <div class="counter ${done === players.length ? 'full' : ''}">グロス入力<br><b>${done}/${players.length}</b></div>
@@ -446,15 +588,16 @@
     const html = `
       <div class="counters" id="counters">${countersHtml(players)}</div>
       <div id="inputMsg"></div>
+      ${isEditing(cur) ? `<div class="banner info">前回の結果（${esc(fmtDate(state.last.date))}）を修正中です。HC はそのコンペ当日の値（確定前の HC）で計算します。再確定するまで、名簿の HC と前回の結果は変わりません。</div>` : ''}
       <p class="muted">${esc(fmtDate(cur.date))}・${players.length}人。入力は自動で保存されます。</p>
       ${players.map((p) => `
         <div class="card player">
           <div class="player-head"><span class="name">${esc(p.name)}</span>
-            <span class="meta">HC ${esc(p.hc)}・NET <span id="net-${esc(p.id)}">${p.gross === null ? '—' : p.gross - p.hc}</span></span></div>
+            <span class="meta">HC ${esc(p.hc)}・NET <span id="net-${esc(p.id)}">${p.grossOk ? p.gross - p.hc : '—'}</span></span></div>
           <div class="grid">
             <div class="cell">グロス
-              <input type="text" class="gross-input" inputmode="numeric" autocomplete="off"
-                data-input="gross" data-id="${esc(p.id)}" value="${p.gross === null ? '' : p.gross}" aria-label="${esc(p.name)}のグロス"></div>
+              <input type="text" class="gross-input${!p.grossOk && p.gross !== null ? ' invalid' : ''}" inputmode="numeric" autocomplete="off"
+                data-input="gross" data-id="${esc(p.id)}" value="${esc(grossFieldText(cur, p.id))}" aria-label="${esc(p.name)}のグロス"></div>
             ${stepHtml(p, 'nearPin', 'ニアピン')}
             ${stepHtml(p, 'driving', 'ドラコン')}
             ${stepHtml(p, 'birdie', 'バーディー')}
@@ -497,6 +640,47 @@
     const v = L.validate(players);
     if (v.errors.length) return { players, validation: v, result: null };
     return { players, validation: v, result: L.computeResults(players, state.settings, cur.tieOrders) };
+  }
+
+  // ---------------------------------------------------------------- 前回の結果の修正
+  /**
+   * 前回の結果から、修正用の入力中のコンペを作る（要件メモ 10章【2026-11-17】）。
+   * 入力内容を保存していない古い結果は、結果（順位表・各賞）から復元する（同点の指定順は復元しない）。
+   * 戻り値：{ current, missing: [名簿から削除された参加者の氏名] }
+   */
+  function editDraftFromLast(last) {
+    const inp = last.input || L.inputFromResult(last.result);
+    const rosterIndex = new Map(state.members.map((m, i) => [m.id, i]));
+    const nameOf = new Map(last.result.netTable.map((p) => [p.id, p.name]));
+    const all = [...new Set(inp.participantIds)];
+    const missing = all.filter((id) => !rosterIndex.has(id)).map((id) => nameOf.get(id) || id);
+    // 参加者は名簿の順に並べる（ふつうに参加者を選んだときと同じ）
+    const ids = all.filter((id) => rosterIndex.has(id)).sort((a, b) => rosterIndex.get(a) - rosterIndex.get(b));
+    // 古い結果から復元した値も、保存データと同じ範囲に収める（複製なので前回の結果は書き換わらない）
+    const scores = sanitizeScores(inp.scores);
+    const hc = sanitizeHcMap(inp.hc);
+    return {
+      missing,
+      current: {
+        date: last.date,
+        participantIds: ids,
+        scores: Object.fromEntries(ids.filter((id) => own(scores, id)).map((id) => [id, scores[id]])),
+        tieOrders: sanitizeTieOrders(inp.tieOrders),
+        hcSnapshot: Object.fromEntries(ids.filter((id) => own(hc, id)).map((id) => [id, hc[id]])),
+        edit: { of: last.confirmedAt },
+      },
+    };
+  }
+
+  /** 確定時に前回の結果へ保存する入力内容（あとで修正するときに使う） */
+  function inputSnapshot(cur, players) {
+    const ids = players.map((p) => p.id);
+    return {
+      participantIds: ids,
+      scores: Object.fromEntries(players.map((p) => [p.id, { gross: p.gross, nearPin: p.nearPin, driving: p.driving, birdie: p.birdie }])),
+      tieOrders: sanitizeTieOrders(cur.tieOrders),
+      hc: Object.fromEntries(players.map((p) => [p.id, p.hc])),
+    };
   }
 
   // ---------------------------------------------------------------- 同点の決定
@@ -632,29 +816,40 @@
     if (!result) { location.replace('#/input'); return; }
     if (result.pendingTies.length) { location.replace('#/tie'); return; }
     const hasTie = result.appliedTies.length > 0; // 今回の判定で実際に使った同点指定があるときだけ
+    const editing = isEditing(state.current);
     const html = `
-      <div class="banner info">まだ確定していません。内容を確認して、下の「確定」を押すと新しい HC が名簿に反映されます。</div>
+      ${editing
+        ? '<div class="banner info">前回の結果を修正しています。まだ再確定していません。内容を確認して、下の「再確定」を押すと、前回の結果がこの内容に置き換わり、名簿の HC が付け直されます。</div>'
+        : '<div class="banner info">まだ確定していません。内容を確認して、下の「確定」を押すと新しい HC が名簿に反映されます。</div>'}
       ${resultBodyHtml(result)}
       ${hasTie ? '<button class="btn" data-action="reset-ties">同点の順番を決め直す</button>' : ''}
       <button class="btn" data-action="nav" data-href="/input">入力に戻って直す</button>
-      <div class="bottom-bar"><div class="inner"><button class="btn primary" data-action="confirm-result">確定して HC を名簿に反映</button></div></div>`;
+      <div class="bottom-bar"><div class="inner"><button class="btn primary" data-action="confirm-result">${editing ? '再確定して HC を名簿に反映' : '確定して HC を名簿に反映'}</button></div></div>`;
     return { title: `結果 ${fmtDate(state.current.date)}`, html };
   }
 
   function viewLast() {
     const last = state.last;
     if (!last) { location.replace('#/'); return; }
+    const revisedAt = last.revised ? fmtDateTime(last.confirmedAt) : '';
     const html = `
       <div class="banner info">確定済みの結果です（${esc(fmtDate(last.date))}）。新しい HC は名簿に反映済みです。
+        ${last.revised ? `<br>修正して再確定した結果です（${esc(revisedAt || '日時不明')}）。` : ''}
         ${!state.lastBackupAt || state.lastBackupAt < last.confirmedAt ? '<br>HC が変わったので、<a href="#/backup">バックアップ</a>の書き出しをおすすめします。' : ''}</div>
-      ${resultBodyHtml(last.result)}`;
+      ${isEditing(state.current) ? '<div class="banner warn">この結果を修正中です（まだ再確定していません）。続きはホームの「入力の続き」からできます。</div>' : ''}
+      ${resultBodyHtml(last.result)}
+      <h2>結果の修正</h2>
+      <p class="muted small">入力に誤りがあったときは、スコアなどを直して確定し直せます。HC はそのコンペ当日の値で計算し直し、再確定したときに名簿の HC を付け直します。</p>
+      <button class="btn" data-action="edit-last">この結果を修正する</button>`;
     return { title: `前回の結果 ${fmtDate(last.date)}`, html };
   }
 
   function currentMeta() {
     if (route() === '/last' && state.last) return { name: state.last.competitionName, date: state.last.date, result: state.last.result };
     const { result } = computeCurrent();
-    return { name: state.settings.competitionName, date: state.current.date, result };
+    // 前回の結果の修正中は、再確定後と同じく元の結果のコンペ名を使う
+    const name = isEditing(state.current) ? state.last.competitionName : state.settings.competitionName;
+    return { name, date: state.current.date, result };
   }
 
   // ---------------------------------------------------------------- 共有用テキスト・画像
@@ -969,9 +1164,38 @@
         break;
 
       case 'new-compe': {
-        if (state.current && !confirm(`入力中のコンペ（${fmtDate(state.current.date)}）があります。破棄して新しく始めますか？\n（参加者を選んで「スコア入力へ」を押すまでは、入力中のコンペは残ります）`)) return;
+        const msg = isEditing(state.current)
+          ? `前回の結果（${fmtDate(state.last.date)}）を修正中です。修正をやめて新しく始めますか？\n（修正をやめても、名簿の HC と前回の結果は元のままです。参加者を選んで「スコア入力へ」を押すまでは、修正中の内容は残ります）`
+          : `入力中のコンペ（${fmtDate(state.current && state.current.date)}）があります。破棄して新しく始めますか？\n（参加者を選んで「スコア入力へ」を押すまでは、入力中のコンペは残ります）`;
+        if (state.current && !confirm(msg)) return;
         selectDraft = makeSelectDraft(today(), [], true);
         go('/select');
+        break;
+      }
+      case 'edit-last': {
+        const last = state.last;
+        if (!last) { render(); return; }
+        const draft = editDraftFromLast(last);
+        if (draft.missing.length) {
+          alert(`名簿から削除された参加者（${draft.missing.join('、')}）がいるため修正できません。`);
+          return;
+        }
+        // 前回の結果の検査で当日 HC は全員分そろうはずだが、念のため確かめる（欠けると HC が二重に減るため。Ver1.3）
+        if (!hasAllDayHc(draft.current.hcSnapshot, last.result)) {
+          alert('前回の結果に、コンペ当日の HC が欠けている参加者がいるため修正できません。');
+          return;
+        }
+        if (state.current) {
+          const msg = isEditing(state.current)
+            ? 'この結果は修正中です。修正中の内容を破棄して、最初から修正し直しますか？\n（修正の続きは、ホームの「入力の続き」からできます）'
+            : `入力中のコンペ（${fmtDate(state.current.date)}）を破棄して、前回の結果を修正しますか？`;
+          if (!confirm(msg)) return;
+        }
+        state.current = draft.current;
+        selectDraft = null;
+        tieDraft = {};
+        save();
+        go('/input');
         break;
       }
 
@@ -1123,24 +1347,60 @@
         break;
       }
       case 'confirm-result': {
-        const { result } = computeCurrent();
+        const { players, result } = computeCurrent();
         if (!result || result.pendingTies.length) { render(); return; }
-        const changes = result.hcUpdates.map((u) => `・${u.name}：${u.oldHc} → ${u.newHc}${u.newHc === u.oldHc ? '（変化なし）' : ''}`).join('\n') || '・なし';
-        if (!confirm(`結果を確定します。\n名簿の HC を次のように更新します。\n${changes}\n\n確定後は入力内容を変更できません。よろしいですか？`)) return;
-        for (const u of result.hcUpdates) {
-          const m = state.members.find((x) => x.id === u.id);
-          if (m) m.hc = u.newHc;
+        const editing = isEditing(state.current);
+        if (editing) {
+          // 守り（Ver1.3）：前回の参加者で今回も参加している人の当日 HC がそろっていなければ再確定しない
+          // （欠けた人は名簿の、確定で減らした後の HC で計算され、HC が二重に減るため）
+          const prevIds = new Set(state.last.result.netTable.map((p) => p.id));
+          const noDayHc = players.filter((p) => prevIds.has(p.id) && !(state.current.hcSnapshot && own(state.current.hcSnapshot, p.id)));
+          if (noDayHc.length) {
+            alert(`${noDayHc.map((p) => p.name).join('、')} のコンペ当日の HC が見つからないため、再確定できません。\n前回の結果の画面の「この結果を修正する」から、修正をやり直してください。`);
+            return;
+          }
+          // 前回の結果の修正：名簿の今の HC → 再確定後の HC を示す（要件メモ 10章【2026-11-17】）
+          const plan = L.planReconfirmHc(state.last.result.hcUpdates, result.hcUpdates, state.members);
+          // 守り（Ver1.3）：名簿に入れる HC は 0〜99 の整数だけ（範囲外の HC が入ると、次の起動でその人が名簿から外れるため）
+          const badPlan = plan.filter((c) => !isHcInt(c.to));
+          if (badPlan.length) {
+            alert(`${badPlan.map((c) => c.name).join('、')} の再確定後の HC が正しくない（${badPlan.map((c) => c.to).join('、')}）ため、再確定できません。`);
+            return;
+          }
+          const why = (c) => (c.kind === 'revert'
+            ? `${L.AWARD_LABELS[c.prevAward]}から外れたため、当日の HC に戻す`
+            : L.AWARD_LABELS[c.award]) + (c.from === c.to ? '・変化なし' : '');
+          const lines = plan.map((c) => `・${c.name}：${c.from} → ${c.to}（${why(c)}）${c.manual ? '※' : ''}`).join('\n') || '・なし';
+          const manual = plan.filter((c) => c.manual);
+          const manualNote = manual.length
+            ? `\n\n※ 前回の確定のあと、名簿の HC が手で変えられています（${manual.map((c) => `${c.name}：前回の確定後 ${c.expected} → 今 ${c.from}`).join('、')}）。再確定すると上の値で上書きします。`
+            : '';
+          if (!confirm(`前回の結果（${fmtDate(state.last.date)}）を修正して、確定し直します。\n名簿の HC を次のように変更します（名簿の今の HC → 再確定後の HC）。\n${lines}${manualNote}\n\n再確定すると、前回の結果はこの内容に置き換わります。よろしいですか？`)) return;
+          for (const c of plan) {
+            const m = state.members.find((x) => x.id === c.id);
+            if (m) m.hc = c.to;
+          }
+        } else {
+          const changes = result.hcUpdates.map((u) => `・${u.name}：${u.oldHc} → ${u.newHc}${u.newHc === u.oldHc ? '（変化なし）' : ''}`).join('\n') || '・なし';
+          if (!confirm(`結果を確定します。\n名簿の HC を次のように更新します。\n${changes}\n\n確定後も、ホームの「前回の結果」から修正できます。よろしいですか？`)) return;
+          for (const u of result.hcUpdates) {
+            const m = state.members.find((x) => x.id === u.id);
+            if (m) m.hc = u.newHc;
+          }
         }
         state.last = {
           date: state.current.date,
-          competitionName: state.settings.competitionName,
+          // 修正して再確定したときは、元の結果のコンペ名を引き継ぐ
+          competitionName: editing ? state.last.competitionName : state.settings.competitionName,
           confirmedAt: new Date().toISOString(),
           result,
+          input: inputSnapshot(state.current, players),
         };
+        if (editing) state.last.revised = true;
         state.current = null;
         tieDraft = {};
         save();
-        toast('確定しました。HC を名簿に反映しました。');
+        toast(editing ? '再確定しました。HC を名簿に付け直しました。' : '確定しました。HC を名簿に反映しました。');
         go('/last');
         break;
       }
@@ -1197,17 +1457,25 @@
     }
   }
 
-  /** グロス欄の値を半角数字3桁までに整えて保存する */
+  /**
+   * グロス欄の値を保存する（Ver1.3）。入力欄の値は削ったり切ったりせず、全角数字を半角にするだけ。
+   * 1〜999 の半角数字なら数値として、0・空欄は未入力として、それ以外（1000 以上、マイナス、小数点、文字など）は
+   * 不正な入力として文字列のまま保存する（「結果を計算」でエラーにする）。
+   */
   function onGrossInput(el) {
     if (!state.current) return;
-    const digits = toHalfWidth(el.value).replace(/\D/g, '').slice(0, 3);
-    if (digits !== el.value) el.value = digits;
-    const v = digits === '' ? null : parseInt(digits, 10);
-    scoreOf(el.dataset.id).gross = v === 0 ? null : v;
-    el.classList.toggle('invalid', v === 0);
-    const hc = (state.members.find((m) => m.id === el.dataset.id) || {}).hc;
+    const half = toHalfWidth(el.value);
+    if (half !== el.value) el.value = half;
+    const g = parseGross(half);
+    const sc = scoreOf(el.dataset.id);
+    sc.gross = g.gross;
+    if (g.text !== null) sc.grossText = g.text;
+    else delete sc.grossText;
+    // 不正な入力と 0（未入力として扱う）は赤枠で示す
+    el.classList.toggle('invalid', g.text !== null || /^0+$/.test(half.trim()));
+    const hc = hcFor(state.current, el.dataset.id, (state.members.find((m) => m.id === el.dataset.id) || {}).hc);
     const netEl = document.getElementById('net-' + el.dataset.id);
-    if (netEl) netEl.textContent = v ? v - hc : '—';
+    if (netEl) netEl.textContent = g.gross !== null ? g.gross - hc : '—';
     save();
     const c = document.getElementById('counters');
     if (c) c.innerHTML = countersHtml(getPlayers(state.current));

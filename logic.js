@@ -15,6 +15,7 @@
   const BIRDIE_MAX = 18;
   const GROSS_WARN_MIN = 50;
   const GROSS_WARN_MAX = 200;
+  const GROSS_MAX = 999;    // グロスの上限（保存データ・前回の結果の検査と同じ 1〜999。要件メモ 4章）
   const HC_MAX = 99;
 
   const DEFAULT_SETTINGS = Object.freeze({
@@ -112,7 +113,7 @@
 
   /**
    * 入力チェック。players: [{id,name,hc,gross,nearPin,driving,birdie}]
-   * gross 未入力は null。errors があると計算できない。warnings は確認すれば続行可。
+   * gross 未入力は null（不正な入力は null 以外の値で渡す）。errors があると計算できない。warnings は確認すれば続行可。
    */
   function validate(players) {
     const errors = [];
@@ -131,8 +132,9 @@
 
       if (p.gross === null || p.gross === undefined || p.gross === '') {
         errors.push(`${who} のグロスが未入力です。`);
-      } else if (!Number.isInteger(p.gross) || p.gross <= 0) {
-        errors.push(`${who} のグロスが正しくありません（正の整数）。`);
+      } else if (!Number.isInteger(p.gross) || p.gross <= 0 || p.gross > GROSS_MAX) {
+        // 1000 以上、マイナス・小数・文字などの不正な入力はエラー（未入力として黙って扱わない）
+        errors.push(`${who} のグロスが正しくありません（1〜${GROSS_MAX} の整数）。`);
       } else if (p.gross < GROSS_WARN_MIN || p.gross > GROSS_WARN_MAX) {
         warnings.push(`${who} のグロス ${p.gross} は通常の範囲（${GROSS_WARN_MIN}〜${GROSS_WARN_MAX}）外です。`);
       }
@@ -189,11 +191,13 @@
   /**
    * 表示用の比較関数：(スコア, HC, 幹事が決めた組内の順番) の辞書式比較。
    * 組に入っていない人の順番は 0 とする。同じ (スコア, HC) の組は1つしかないので推移的になる。
+   * 組内の順番を使うのは、今回の賞の判定で実際に使った同点指定（applied）だけ。
+   * 賞に関係しない同点は、指定が残っていても同順位にする（要件メモ 10章【2026-11-17】Ver1.2）。
    */
-  function withResolvedOrder(cmp, groups) {
+  function withResolvedOrder(cmp, groups, applied) {
     const index = new Map(); // id -> 組内の順番
     for (const g of groups) {
-      if (!g.resolved) continue;
+      if (!g.resolved || !applied.has(g.key)) continue;
       g.members.forEach((m, i) => index.set(m.id, i));
     }
     return (a, b) => cmp(a, b) || (index.get(a.id) || 0) - (index.get(b.id) || 0);
@@ -324,21 +328,22 @@
       hcUpdates.push({ id, name: r.name, award: key, oldHc: r.hc, net: r.net, ...h });
     }
 
-    // 順位表（表示用。完全同点は同順位）
+    // 順位表（表示用。完全同点は同順位。賞の判定で幹事が決めた同点だけ、その順で別の順位）
     const awardOf = (id) => {
       const list = [];
       for (const key of ['win', 'second', 'third', 'booby', 'bestGross']) if (awards[key] === id) list.push(AWARD_LABELS[key]);
       if (awards.seventies.includes(id)) list.push(AWARD_LABELS.seventies);
       return list;
     };
-    const netCmp = withResolvedOrder(byNet, net.groups);
+    const applied = new Set(appliedTies);
+    const netCmp = withResolvedOrder(byNet, net.groups, applied);
     const netAll = rows.slice().sort((a, b) => netCmp(a, b) || a.name.localeCompare(b.name, 'ja'));
     const netRanks = standardRanks(netAll, netCmp);
     const netTable = netAll.map((r, i) => ({
       rank: netRanks[i], id: r.id, name: r.name, gross: r.gross, hc: r.hc, net: r.net,
       isBestGross: r.id === awards.bestGross, awards: awardOf(r.id),
     }));
-    const grossCmp = withResolvedOrder(byGross, gross.groups);
+    const grossCmp = withResolvedOrder(byGross, gross.groups, applied);
     const grossAll = rows.slice().sort((a, b) => grossCmp(a, b) || a.name.localeCompare(b.name, 'ja'));
     const grossRanks = standardRanks(grossAll, grossCmp);
     const grossTable = grossAll.map((r, i) => ({
@@ -355,8 +360,69 @@
   /** HC が更新される賞 */
   const HC_AWARDS = ['win', 'second', 'third'];
 
+  /**
+   * 入力内容を持たない（古い形式の）前回の結果から、入力内容を復元する（要件メモ 10章【2026-11-17】）。
+   * グロス・当日 HC は順位表から、バーディー・ニアピン・ドラコンの本数は各賞の欄から取る。
+   * 同点の指定順は結果に残っていないため復元しない（必要なら同点の画面で聞き直す）。
+   * 戻り値：{ participantIds, scores: {id:{gross,nearPin,driving,birdie}}, tieOrders: {}, hc: {id:当日HC} }
+   */
+  function inputFromResult(result) {
+    const scores = new Map();
+    const hc = new Map();
+    for (const r of result.netTable) {
+      scores.set(r.id, { gross: r.gross, nearPin: 0, driving: 0, birdie: 0 });
+      hc.set(r.id, r.hc);
+    }
+    for (const key of ['birdie', 'nearPin', 'driving']) {
+      for (const e of result.awards[key] || []) if (scores.has(e.id)) scores.get(e.id)[key] = e.count;
+    }
+    // 参加者の id が "__proto__" などでも普通のキーとして扱えるよう、Object.fromEntries で作る
+    return {
+      participantIds: result.netTable.map((r) => r.id),
+      scores: Object.fromEntries(scores),
+      tieOrders: {},
+      hc: Object.fromEntries(hc),
+    };
+  }
+
+  /**
+   * 前回の結果を修正して再確定するときに、名簿の HC をどう付け直すかを決める（要件メモ 10章【2026-11-17】）。
+   * - prevUpdates：前回の結果の HC 更新（oldHc＝当日 HC、newHc＝前回の確定で名簿に入れた HC）
+   * - nextUpdates：修正後の結果の HC 更新（当日 HC から計算したもの）
+   * - members：名簿 [{id,name,hc}]（hc は名簿の今の HC）
+   * 戻り値：[{ id, name, from, to, kind, award, prevAward, expected, manual }]
+   * - from＝名簿の今の HC、to＝再確定後の HC（差分は名簿の今の HC を基準に示す）
+   * - kind 'update'：修正後の優勝〜3位。当日 HC から計算した新 HC にする
+   * - kind 'revert'：前回は優勝〜3位だったが、修正後は外れた人。当日 HC（前回の oldHc）に戻す
+   * - expected：前回の確定のあと名簿にあるはずの HC（前回の優勝〜3位は前回の newHc、それ以外は当日 HC）
+   * - manual：名簿の今の HC が expected と違う（前回の確定のあと手で変えられていた）。再確定では上書きする
+   * 名簿にいない人（削除された人）は含めない。並びは修正後の優勝・2位・3位、続いて外れた人。
+   */
+  function planReconfirmHc(prevUpdates, nextUpdates, members) {
+    const byId = new Map(members.map((m) => [m.id, m]));
+    const prevById = new Map(prevUpdates.map((u) => [u.id, u]));
+    const changes = [];
+    const done = new Set();
+    const push = (id, to, kind, award, prevAward, expected) => {
+      const m = byId.get(id);
+      if (!m || done.has(id)) return;
+      done.add(id);
+      changes.push({ id, name: m.name, from: m.hc, to, kind, award, prevAward, expected, manual: m.hc !== expected });
+    };
+    for (const u of nextUpdates) {
+      const p = prevById.get(u.id);
+      push(u.id, u.newHc, 'update', u.award, p ? p.award : null, p ? p.newHc : u.oldHc);
+    }
+    for (const p of prevUpdates) {
+      if (nextUpdates.some((u) => u.id === p.id)) continue;
+      push(p.id, p.oldHc, 'revert', null, p.award, p.newHc);
+    }
+    return changes;
+  }
+
   return {
-    NEAR_PIN_MAX, DRIVING_MAX, BIRDIE_MAX, HC_MAX, DEFAULT_SETTINGS, AWARD_LABELS, SETTING_RANGES, HC_AWARDS,
+    NEAR_PIN_MAX, DRIVING_MAX, BIRDIE_MAX, GROSS_MAX, HC_MAX, DEFAULT_SETTINGS, AWARD_LABELS, SETTING_RANGES, HC_AWARDS,
     cloneDefaults, normalizeSettings, hcReduction, newHandicap, validate, computeResults,
+    inputFromResult, planReconfirmHc,
   };
 });

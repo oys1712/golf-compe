@@ -1,5 +1,6 @@
-// オフライン用 Service Worker。ファイルを更新したら CACHE_VERSION を上げること。
-const CACHE_VERSION = 'compe-v7';
+// オフライン用 Service Worker。ファイルを更新したら CACHE_VERSION を新しいバージョン表記に変えること。
+// バージョンを変えるときは、app.js の APP_VERSION と両方を同じ表記にする（例：'Ver1.2'）。
+const CACHE_VERSION = 'Ver1.3';
 const ASSETS = [
   './',
   './index.html',
